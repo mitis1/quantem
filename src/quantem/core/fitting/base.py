@@ -707,6 +707,7 @@ class FitBase(OptimizerMixin):
     ) -> None:
         for component_name, param in constraint_configs.items():
             component = self._resolve_component_by_name(str(component_name))
+            component = cast(RenderComponent, component)
             component.initialize_constraint_config(param, strict=strict)
 
     def _iter_named_components(self) -> list[tuple[str, RenderComponent]]:

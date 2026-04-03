@@ -367,13 +367,7 @@ class DiskTemplate(RenderComponent):
         circular_loss = torch.as_tensor(circular_weight, device=ctx.device, dtype=ctx.dtype) * circular_err
 
         return cutoff_loss + tv_loss + circular_loss
-    
-    def get_optimization_parameters(self) -> Any: 
-        params = []
-        for name, param in self.named_parameters(recurse=True):
-            if not name.startswith('origin.') and param.requires_grad:
-                params.append(param)
-        return params
+
 
         
 
@@ -690,10 +684,3 @@ class SyntheticDiskLattice(RenderComponent):
             self.disk.add_patch(out, r0=rr0, c0=cc0, scale=inten)
 
         return out
-    
-    def get_optimization_parameters(self) -> Any: 
-        params = []
-        for name, param in self.named_parameters(recurse=True):
-            if not name.startswith('disk.') and param.requires_grad:
-                params.append(param)
-        return params

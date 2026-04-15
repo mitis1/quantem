@@ -665,11 +665,32 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             )
         return self._render_state_array(self.state_individual_refined[row, col])
 
-    def fit_strain(self) -> "ModelDiffraction":
+    def fit_strain(
+        self, 
+        ref_positions_rows: np.ndarray | torch.Tensor | None = None,
+        ref_positions_cols: np.ndarray | torch.Tensor | None = None,
+    ) -> "ModelDiffraction":
         u_fit = self.u_array
         v_fit = self.v_array
-        u_ref = np.median(u_fit.reshape(-1, 2), axis=0)
-        v_ref = np.median(v_fit.reshape(-1, 2), axis=0)
+
+        if ref_positions_rows is None or ref_positions_cols is None:
+            u_ref = np.median(u_fit.reshape(-1, 2), axis=0)
+            v_ref = np.median(v_fit.reshape(-1, 2), axis=0)
+        elif ref_positions_rows is not None and ref_positions_cols is not None:
+            if (np.all(ref_positions_rows >= 0) and 
+                np.all(ref_positions_rows < self.dataset.shape[0]) and
+                np.all(ref_positions_cols >= 0) and 
+                np.all(ref_positions_cols < self.dataset.shape[1])):
+                
+                u_fit_filtered = u_fit[ref_positions_rows, ref_positions_cols]
+                v_fit_filtered =  v_fit[ref_positions_rows, ref_positions_cols]
+                
+                u_ref = np.median(u_fit_filtered.reshape(-1,2), axis=0)
+                v_ref = np.median(v_fit_filtered.reshape(-1,2), axis=0)
+            else:
+                raise ValueError("reference positions outside bounds of dataset")
+        else:
+            raise ValueError("Must provide both ref_positions_rows and ref_positions_cols")
 
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]

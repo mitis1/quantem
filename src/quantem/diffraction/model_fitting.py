@@ -667,30 +667,30 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
     def fit_strain(
         self, 
-        ref_positions_rows: np.ndarray | torch.Tensor | None = None,
-        ref_positions_cols: np.ndarray | torch.Tensor | None = None,
+        mask_reference=None,
     ) -> "ModelDiffraction":
         u_fit = self.u_array
         v_fit = self.v_array
 
-        if ref_positions_rows is None or ref_positions_cols is None:
+        if mask_reference is None:
             u_ref = np.median(u_fit.reshape(-1, 2), axis=0)
             v_ref = np.median(v_fit.reshape(-1, 2), axis=0)
-        elif ref_positions_rows is not None and ref_positions_cols is not None:
-            if (np.all(ref_positions_rows >= 0) and 
-                np.all(ref_positions_rows < self.dataset.shape[0]) and
-                np.all(ref_positions_cols >= 0) and 
-                np.all(ref_positions_cols < self.dataset.shape[1])):
-                
-                u_fit_filtered = u_fit[ref_positions_rows, ref_positions_cols]
-                v_fit_filtered =  v_fit[ref_positions_rows, ref_positions_cols]
-                
-                u_ref = np.median(u_fit_filtered.reshape(-1,2), axis=0)
-                v_ref = np.median(v_fit_filtered.reshape(-1,2), axis=0)
-            else:
-                raise ValueError("reference positions outside bounds of dataset")
         else:
-            raise ValueError("Must provide both ref_positions_rows and ref_positions_cols")
+            m = np.asarray(mask_reference, dtype=bool)
+            u_ref = np.array(
+                (
+                    np.median(u_fit[m, 0]),
+                    np.median(u_fit[m, 1]),
+                ),
+                dtype=float,
+            )
+            v_ref = np.array(
+                (
+                    np.median(v_fit[m, 0]),
+                    np.median(v_fit[m, 1]),
+                ),
+                dtype=float,
+            )
 
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]

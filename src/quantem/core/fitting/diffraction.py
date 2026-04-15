@@ -472,16 +472,16 @@ class SyntheticDiskLattice(RenderComponent):
         u_col_init, u_col_lo, u_col_hi = self.parse_bounded_init(u_col, name="u_col")
         v_row_init, v_row_lo, v_row_hi = self.parse_bounded_init(v_row, name="v_row")
         v_col_init, v_col_lo, v_col_hi = self.parse_bounded_init(v_col, name="v_col")
-        self.u_row = nn.Parameter(torch.tensor(u_row_init, dtype=torch.float32))
+        self.u_row = nn.Parameter(torch.tensor(u_row_init, dtype=torch.float64))
         if u_row_lo is not None or u_row_hi is not None:
             self.register_parameter_bounds("u_row", u_row_lo, u_row_hi)
-        self.u_col = nn.Parameter(torch.tensor(u_col_init, dtype=torch.float32))
+        self.u_col = nn.Parameter(torch.tensor(u_col_init, dtype=torch.float64))
         if u_col_lo is not None or u_col_hi is not None:
             self.register_parameter_bounds("u_col", u_col_lo, u_col_hi)
-        self.v_row = nn.Parameter(torch.tensor(v_row_init, dtype=torch.float32))
+        self.v_row = nn.Parameter(torch.tensor(v_row_init, dtype=torch.float64))
         if v_row_lo is not None or v_row_hi is not None:
             self.register_parameter_bounds("v_row", v_row_lo, v_row_hi)
-        self.v_col = nn.Parameter(torch.tensor(v_col_init, dtype=torch.float32))
+        self.v_col = nn.Parameter(torch.tensor(v_col_init, dtype=torch.float64))
         if v_col_lo is not None or v_col_hi is not None:
             self.register_parameter_bounds("v_col", v_col_lo, v_col_hi)
 

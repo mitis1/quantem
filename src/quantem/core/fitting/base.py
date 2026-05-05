@@ -6,9 +6,20 @@ from typing import Any, Literal, Self, Sequence, cast
 import numpy as np
 import torch
 from torch import nn
+<<<<<<< HEAD
 from tqdm.auto import tqdm
 
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
+=======
+from tqdm import tqdm
+
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerMixin,
+    OptimizerParams,
+    OptimizerType,
+    SchedulerType,
+)
+>>>>>>> upstream/fitting_models_clean
 
 
 def parse_bounded_init(
@@ -93,13 +104,19 @@ class OriginND(nn.Module):
 class RenderComponent(nn.Module):
     DEFAULT_HARD_CONSTRAINTS: dict[str, Any] = {}
     DEFAULT_SOFT_CONSTRAINTS: dict[str, Any] = {}
+<<<<<<< HEAD
     DEFAULT_CONSTRAINT_CONFIG: dict[str, Any] = {}
+=======
+>>>>>>> upstream/fitting_models_clean
 
     def __init__(self) -> None:
         super().__init__()
         self.hard_constraints: dict[str, Any] = dict(self.DEFAULT_HARD_CONSTRAINTS)
         self.soft_constraints: dict[str, Any] = dict(self.DEFAULT_SOFT_CONSTRAINTS)
+<<<<<<< HEAD
         self.constraint_config: dict[str, Any] = dict(self.DEFAULT_CONSTRAINT_CONFIG)
+=======
+>>>>>>> upstream/fitting_models_clean
         self.parameter_bounds: dict[str, tuple[float | None, float | None]] = {}
 
     @staticmethod
@@ -271,6 +288,7 @@ class RenderComponent(nn.Module):
         self, ctx: RenderContext, params: dict[str, Any] | None = None
     ) -> torch.Tensor:
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+<<<<<<< HEAD
     
     def initialize_constraint_config(self, config: dict[str, Any], strict: bool = True) -> None:
         if not hasattr(self, 'constraint_config'):
@@ -293,6 +311,8 @@ class RenderComponent(nn.Module):
             keys = ", ".join(str(k) for k in unknown.keys())
             raise KeyError(f"Unknown constraint keys for {self.__class__.__name__}: {keys}")
         return
+=======
+>>>>>>> upstream/fitting_models_clean
 
 
 class AdditiveRenderModel(nn.Module):
@@ -369,6 +389,7 @@ class FitResult:
     metrics: dict[str, list[float]] = field(default_factory=dict)
 
 
+<<<<<<< HEAD
 class BCEMSELoss(nn.Module):
 
     def __init__(
@@ -403,6 +424,8 @@ class BCEMSELoss(nn.Module):
         return total_loss
 
 
+=======
+>>>>>>> upstream/fitting_models_clean
 class FitBase(OptimizerMixin):
     DEFAULT_LR = 1e-2
     DEFAULT_OPTIMIZER_TYPE = "adam"
@@ -410,9 +433,13 @@ class FitBase(OptimizerMixin):
     def __init__(self):
         super().__init__()
         # Core wiring
+<<<<<<< HEAD
         # self.loss_fn = torch.nn.L1Loss(reduction="mean")
         self.loss_fn = torch.nn.MSELoss(reduction="mean")
         # self.loss_fn = BCEMSELoss()
+=======
+        self.loss_fn = torch.nn.MSELoss(reduction="mean")
+>>>>>>> upstream/fitting_models_clean
         self.model: AdditiveRenderModel | None = None
         self.ctx: RenderContext | None = None
 
@@ -622,9 +649,14 @@ class FitBase(OptimizerMixin):
         n_steps: int,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
+<<<<<<< HEAD
         constraint_config_params: dict[str, Any] | None = None,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
+=======
+        optimizer_params: OptimizerType | dict | None = None,
+        scheduler_params: SchedulerType | dict | None = None,
+>>>>>>> upstream/fitting_models_clean
         progress: bool = False,
         run_key: str = "default",
         **kwargs: Any,
@@ -672,8 +704,11 @@ class FitBase(OptimizerMixin):
             raise RuntimeError("Model and context are not defined for fitting.")
         if constraint_params is not None:
             self.model.apply_constraint_params(constraint_params, strict=True)
+<<<<<<< HEAD
         if constraint_config_params is not None:
             self.apply_constraint_configs(constraint_config_params, strict=True)
+=======
+>>>>>>> upstream/fitting_models_clean
 
         optimizer_rebuilt = False
         if optimizer_params is not None:
@@ -737,6 +772,7 @@ class FitBase(OptimizerMixin):
             self.fit_history[key] = result
         return result
 
+<<<<<<< HEAD
     def apply_constraint_configs(
         self, constraint_configs: dict[str, Any], strict: bool = True
     ) -> None:
@@ -745,6 +781,8 @@ class FitBase(OptimizerMixin):
             component = cast(RenderComponent, component)
             component.initialize_constraint_config(param, strict=strict)
 
+=======
+>>>>>>> upstream/fitting_models_clean
     def _iter_named_components(self) -> list[tuple[str, RenderComponent]]:
         """
         Return canonical component names paired with components.
@@ -791,7 +829,16 @@ class FitBase(OptimizerMixin):
 
     def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
         if self.optimizer_params:
+<<<<<<< HEAD
             return dict(self.optimizer_params)
+=======
+            op = self.optimizer_params
+            if isinstance(op, OptimizerParams.NoneOptimizer):
+                return {"type": "none"}
+            out: dict[str, Any] = dict(op.params())
+            out["type"] = op._name
+            return out
+>>>>>>> upstream/fitting_models_clean
         if self.optimizer is not None:
             opt_type: str | type[torch.optim.Optimizer]
             if isinstance(self.optimizer, torch.optim.AdamW):

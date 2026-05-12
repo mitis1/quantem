@@ -1248,15 +1248,26 @@ class _BatchedPlan:
             for k in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
                 self.lrs[f"lat.{k}"] = lr
                 lat_keys.append(f"lat.{k}")
-            # Origin uses the lattice's LR (lattice is the most common owner of origin).
-            self.lrs["origin.coords"] = lr
             name = model._component_constraint_name(self.lat, self.lat_idx)
             self.component_keys[name] = lat_keys
             self.component_keys[self.lat.__class__.__name__] = list(lat_keys)
+
+        # Origin LR: prefer explicit optimizer_params["origin"], else fall back to
+        # lattice -> gaussbg -> default (matches the serial-path fallback).
+        if "origin" in optimizer_params:
+            self.lrs["origin.coords"] = float(
+                optimizer_params["origin"].get("lr", 1e-2)
+            )
+        elif self.lat is not None and self.lat_idx is not None:
+            self.lrs["origin.coords"] = self.lrs["lat.u_row"]
         elif self.gaussbg is not None and self.gaussbg_idx is not None:
             self.lrs["origin.coords"] = self.lrs["gaussbg.intensity_raw"]
         else:
             self.lrs["origin.coords"] = 1e-2
+
+        # Expose "origin" as a routable name so scheduler_params and
+        # frozen_components can target it just like a component.
+        self.component_keys["origin"] = ["origin.coords"]
 
         # Default schedulers: constant LR for every key.
         self.scheduler_specs = {k: {"type": "none"} for k in self.lrs}

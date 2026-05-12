@@ -85,15 +85,65 @@ class RenderContext:
     fields: dict[str, Any] = field(default_factory=dict)
 
 
-class OriginND(nn.Module):
+class OriginND(OptimizerMixin, nn.Module):
+    """
+    Shared probe-origin coordinate parameter.
+
+    Origin is referenced as a submodule by multiple components (e.g. DiskTemplate,
+    SyntheticDiskLattice, GaussianBackground). Each of those components excludes
+    ``origin.coords`` from its own optimizer (see
+    ``RenderComponent.get_optimization_parameters``); ``OriginND`` owns the single
+    optimizer that actually updates the coordinate. ``AdditiveRenderModel`` drives
+    this optimizer alongside its component optimizers in the fit loop.
+
+    Configure via ``optimizer_params={"origin": {"type": ..., "lr": ...}}`` (and
+    optionally ``scheduler_params={"origin": {...}}``). Set ``lr=0`` to freeze the
+    probe across all components.
+    """
+
+    DEFAULT_OPTIMIZER: str = "adamw"
+    DEFAULT_LR: float = 1e-2
+    DEFAULT_SCHEDULER_TYPE: str = "none"
+
     def __init__(self, *, ndim: int, init: Sequence[float]):
-        super().__init__()
+        nn.Module.__init__(self)
         if int(ndim) <= 0:
             raise ValueError("ndim must be >= 1.")
         if len(init) != int(ndim):
             raise ValueError("init length must match ndim.")
         self.ndim = int(ndim)
         self.coords = nn.Parameter(torch.as_tensor(init, dtype=torch.float32).reshape(self.ndim))
+
+        self._optimizer = None
+        self._scheduler = None
+        self._optimizer_params = {}
+        self._scheduler_params = {}
+
+    def get_optimization_parameters(self) -> Any:
+        return [self.coords] if self.coords.requires_grad else []
+
+    def initialize_optimizer(
+        self,
+        optimizer_params: dict[str, Any] | None = None,
+        scheduler_params: dict[str, Any] | None = None,
+        num_iter: int | None = None,
+    ) -> None:
+        trainable_params = list(self.get_optimization_parameters())
+        if not trainable_params:
+            self._optimizer = None
+            self._scheduler = None
+            return
+        if optimizer_params is not None:
+            self.optimizer_params = optimizer_params
+        else:
+            self.optimizer_params = {"type": self.DEFAULT_OPTIMIZER, "lr": self.DEFAULT_LR}
+        self.set_optimizer(self.optimizer_params)
+
+        if scheduler_params is not None:
+            self.scheduler_params = scheduler_params
+        else:
+            self.scheduler_params = {"type": self.DEFAULT_SCHEDULER_TYPE}
+        self.set_scheduler(self.scheduler_params, num_iter=num_iter)
 
 
 class RenderComponent(OptimizerMixin,nn.Module):
@@ -298,8 +348,20 @@ class RenderComponent(OptimizerMixin,nn.Module):
     ) -> torch.Tensor:
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
 
-    def get_optimization_parameters(self) -> Any: 
-        return [p for p in self.parameters() if p.requires_grad]
+    def get_optimization_parameters(self) -> Any:
+        # Shared OriginND parameters are owned by the model-level origin
+        # optimizer (see AdditiveRenderModel), not by individual components.
+        # Excluding them here prevents origin.coords from being stepped once
+        # per origin-owning component per iteration.
+        exclude_ids: set[int] = set()
+        origin_module = getattr(self, "origin", None)
+        if isinstance(origin_module, OriginND):
+            for p in origin_module.parameters():
+                exclude_ids.add(id(p))
+        return [
+            p for p in self.parameters()
+            if p.requires_grad and id(p) not in exclude_ids
+        ]
     
     def initialize_optimizer(self, 
         optimizer_params: dict[str, Any] | None = None,
@@ -331,8 +393,16 @@ class RenderComponent(OptimizerMixin,nn.Module):
     
     
     def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
-        if self.optimizer_params:
-            return dict(self.optimizer_params)
+        import dataclasses
+        op = self.optimizer_params
+        if op:
+            if dataclasses.is_dataclass(op):
+                d = {f.name: getattr(op, f.name) for f in dataclasses.fields(op)}
+                name = d.pop("_name", None) or type(op).__name__.lower()
+                d["type"] = name
+                return d
+            if isinstance(op, dict):
+                return dict(op)
         if self.optimizer is not None:
             opt_type: str | type[torch.optim.Optimizer]
             if isinstance(self.optimizer, torch.optim.AdamW):
@@ -353,10 +423,18 @@ class RenderComponent(OptimizerMixin,nn.Module):
             "type": getattr(self, "DEFAULT_OPTIMIZER_TYPE", self.DEFAULT_OPTIMIZER),
             "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
         }
-    
+
     def _infer_scheduler_rebuild_params(self) -> dict[str, Any]:
-        if self.scheduler_params:
-            return dict(self.scheduler_params)
+        import dataclasses
+        sp = self.scheduler_params
+        if sp:
+            if dataclasses.is_dataclass(sp):
+                d = {f.name: getattr(sp, f.name) for f in dataclasses.fields(sp)}
+                name = d.pop("_name", None) or type(sp).__name__.lower()
+                d["type"] = name
+                return d
+            if isinstance(sp, dict):
+                return dict(sp)
         return {
             "type": self.DEFAULT_SCHEDULER_TYPE,
         }
@@ -459,7 +537,7 @@ class AdditiveRenderModel(nn.Module): # step all otpimzers
             loss = loss + component.constraint_loss(ctx)
         return loss
 
-    def initilize_independant_optimizers(self, 
+    def initilize_independant_optimizers(self,
         individual_optimizers: dict[str, dict[str, Any]] | None = None,
         individual_schedulers: dict[str, dict[str, Any]] | None = None,
         num_iter: int | None = None,
@@ -481,10 +559,69 @@ class AdditiveRenderModel(nn.Module): # step all otpimzers
                     component_scheduler_params = individual_schedulers[component_name]
                 elif component.__class__.__name__ in individual_schedulers:
                     component_scheduler_params = individual_schedulers[component.__class__.__name__]
-            
+
             component.initialize_optimizer(component_optimizer_params, component_scheduler_params, num_iter=num_iter)
+
+        self._initialize_origin_optimizer(
+            individual_optimizers, individual_schedulers, num_iter=num_iter
+        )
+
+    def _origin_fallback_lr(
+        self, individual_optimizers: dict[str, dict[str, Any]] | None
+    ) -> float:
+        """Pick a default LR for origin when no ``"origin"`` key is supplied.
+
+        Priority matches the batched plan: SyntheticDiskLattice > GaussianBackground
+        > DiskTemplate > OriginND.DEFAULT_LR. We compare by class name to avoid
+        importing the diffraction subclasses here (which would be a circular import).
+        """
+        owners: list[tuple[int, RenderComponent]] = []
+        for idx, module in enumerate(self.components):
+            comp = cast(RenderComponent, module)
+            comp_origin = getattr(comp, "origin", None)
+            if isinstance(comp_origin, OriginND) and comp_origin is self.origin:
+                owners.append((idx, comp))
+
+        def _lr_for(idx: int, comp: RenderComponent) -> float:
+            name = self._component_constraint_name(comp, idx)
+            if individual_optimizers is not None:
+                if name in individual_optimizers:
+                    return float(individual_optimizers[name].get("lr", comp.DEFAULT_LR))
+                if comp.__class__.__name__ in individual_optimizers:
+                    return float(
+                        individual_optimizers[comp.__class__.__name__].get("lr", comp.DEFAULT_LR)
+                    )
+            return float(comp.DEFAULT_LR)
+
+        for pri in ("SyntheticDiskLattice", "GaussianBackground", "DiskTemplate"):
+            for idx, comp in owners:
+                if comp.__class__.__name__ == pri:
+                    return _lr_for(idx, comp)
+        if owners:
+            return _lr_for(*owners[0])
+        return float(OriginND.DEFAULT_LR)
+
+    def _initialize_origin_optimizer(
+        self,
+        individual_optimizers: dict[str, dict[str, Any]] | None,
+        individual_schedulers: dict[str, dict[str, Any]] | None,
+        num_iter: int | None = None,
+    ) -> None:
+        if not isinstance(self.origin, OriginND):
+            return
+        if individual_optimizers is not None and "origin" in individual_optimizers:
+            origin_opt = dict(individual_optimizers["origin"])
+        else:
+            origin_opt = {
+                "type": OriginND.DEFAULT_OPTIMIZER,
+                "lr": self._origin_fallback_lr(individual_optimizers),
+            }
+        origin_sched = None
+        if individual_schedulers is not None and "origin" in individual_schedulers:
+            origin_sched = individual_schedulers["origin"]
+        self.origin.initialize_optimizer(origin_opt, origin_sched, num_iter=num_iter)
     
-    def set_independant_optimizer_params(self, 
+    def set_independant_optimizer_params(self,
         individual_optimizer_params: dict[str, dict[str, Any]],
         individual_scheduler_params: dict[str, dict[str, Any]] | None = None,
         num_iter: int | None = None,
@@ -493,20 +630,29 @@ class AdditiveRenderModel(nn.Module): # step all otpimzers
             scheduler_params = None
             if individual_scheduler_params is not None and component_name in individual_scheduler_params:
                 scheduler_params = individual_scheduler_params[component_name]
-        
+
+            if str(component_name) == "origin":
+                if isinstance(self.origin, OriginND):
+                    self.origin.initialize_optimizer(param, scheduler_params, num_iter=num_iter)
+                continue
+
             component = self._resolve_component_by_name(str(component_name))
             component.initialize_optimizer(param,scheduler_params,num_iter)
-    
+
     def rebuild_independant_optimizers(self) -> None:
         for module in self.components:
             component = cast(RenderComponent, module)
             component.initialize_optimizer()
+        if isinstance(self.origin, OriginND):
+            self.origin.initialize_optimizer()
 
     def step_optimizers(self) -> None:
         for module in self.components:
             component = cast(RenderComponent, module)
             component.step_optimizer()
-    
+        if isinstance(self.origin, OriginND):
+            self.origin.step_optimizer()
+
     def step_schedulers(self, loss: float | None = None) -> None:
         for module in self.components:
             component = cast(RenderComponent, module)
@@ -515,11 +661,18 @@ class AdditiveRenderModel(nn.Module): # step all otpimzers
                     component.step_scheduler(loss)
                 except (AttributeError, TypeError):
                     pass
-    
+        if isinstance(self.origin, OriginND) and hasattr(self.origin, 'step_scheduler'):
+            try:
+                self.origin.step_scheduler(loss)
+            except (AttributeError, TypeError):
+                pass
+
     def zero_grad_optimizers(self) -> None:
         for module in self.components:
             component = cast(RenderComponent, module)
             component.zero_optimizer_grad()
+        if isinstance(self.origin, OriginND):
+            self.origin.zero_optimizer_grad()
     
     def _iter_named_components(self) -> list[tuple[str, RenderComponent]]:
         """
@@ -921,9 +1074,15 @@ class FitBase(OptimizerMixin):
             Optional constraint updates applied once to matching components before
             optimization starts. If ``None``, existing component constraints are reused.
         optimizer_params : dict | None, optional
-            Optimizer configuration override for this call.
+            Optimizer configuration override for this call. Keys are component names
+            (or class names), with a special ``"origin"`` key for the shared probe
+            origin (e.g. ``{"origin": {"type": "adamw", "lr": 0.0}}`` to freeze the
+            probe). If ``"origin"`` is omitted, origin inherits the LR of the first
+            origin-owning component in priority order
+            ``SyntheticDiskLattice > GaussianBackground > DiskTemplate``.
         scheduler_params : dict | None, optional
-            Scheduler configuration override for this call.
+            Scheduler configuration override for this call. Also accepts an
+            ``"origin"`` key for the origin scheduler.
         progress : bool, optional
             If ``True``, display a progress bar.
         run_key : str, optional

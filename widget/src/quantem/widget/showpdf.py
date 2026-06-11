@@ -800,6 +800,124 @@ class ShowPDF(anywidget.AnyWidget):
         finally:
             self.computing = False
 
+    def _compute_linescan_all_modes(self):
+        """Per-bin curves for all four plot modes plus the fitted background.
+
+        Mirrors ``_compute_linescan`` but, for each bin, captures
+        (I(k), B(k), F(k), G(r), g(r)) instead of just the active plot_mode.
+        Used by ``save_results`` to export the full line scan. Does NOT update
+        any trait-synced bytes — the live widget keeps its single-mode stack.
+
+        Returns ``None`` if no line is drawn or no bin has valid data; else a
+        dict with the per-bin stacks and shared axes.
+        """
+        import torch
+
+        band = self._line_band_mask()
+        if band is None:
+            return None
+        r0, c0, r1, c1 = self._effective_line()
+        dr, dc = r1 - r0, c1 - c0
+        seg_len_sq = dr * dr + dc * dc
+        length = float(np.sqrt(seg_len_sq))
+        n_bins = max(1, min(int(self.linescan_max_bins), int(round(length)) + 1))
+
+        rows = np.arange(self.scan_rows, dtype=np.float64)[:, None]
+        cols = np.arange(self.scan_cols, dtype=np.float64)[None, :]
+        t = np.clip(((rows - r0) * dr + (cols - c0) * dc) / seg_len_sq, 0.0, 1.0)
+        bin_idx = np.minimum((t * n_bins).astype(int), n_bins - 1)
+
+        Ik_all, valid_bins = self._linescan_bin_radial_means(band, bin_idx, n_bins)
+        if not valid_bins:
+            return None
+        params = self._curve_params()
+        bg_all, f_all = self._pdf.fit_bg_batched(
+            Ik_all, kmin=params["k_min_fit"], kmax=params["k_max_fit"]
+        )
+
+        k_axis = np.asarray(self._pdf.qq, dtype=np.float32)
+        n_k = int(k_axis.size)
+        Ik_stack = np.full((n_bins, n_k), np.nan, dtype=np.float32)
+        bg_stack = np.full((n_bins, n_k), np.nan, dtype=np.float32)
+        Fk_stack = None  # allocated once we know n_k_fk
+        Gr_stack = None  # allocated once we know n_r
+        gr_stack = None  # allocated only if any bin produces a g(r)
+        r_axis = None
+        k_fk_axis = None
+        density_mode = self.density_mode
+        try_gr = density_mode in ("manual", "estimated")
+
+        for j, bin_i in enumerate(valid_bins):
+            self._pdf.Ik = Ik_all[j]
+            self._pdf.bg = bg_all[j]
+            self._pdf.f = f_all[j]
+            self._pdf.calculate_Gr(mask_realspace=None, **params)
+
+            Ik_stack[bin_i] = to_numpy(Ik_all[j]).astype(np.float32)
+            bg_stack[bin_i] = to_numpy(bg_all[j]).astype(np.float32)
+
+            if self._pdf.Fk_masked is not None:
+                fk_j = to_numpy(self._pdf.Fk_masked).astype(np.float32)
+                if Fk_stack is None:
+                    n_k_fk = int(fk_j.size)
+                    k_fk_axis = k_axis[:n_k_fk]
+                    Fk_stack = np.full((n_bins, n_k_fk), np.nan, dtype=np.float32)
+                m = min(int(fk_j.size), Fk_stack.shape[1])
+                Fk_stack[bin_i, :m] = fk_j[:m]
+
+            if self._pdf._r is not None and self._pdf._reduced_pdf is not None:
+                Gr_j = (
+                    self._pdf.reduced_pdf_damped
+                    if self._pdf.reduced_pdf_damped is not None
+                    else self._pdf._reduced_pdf
+                )
+                Gr_j = to_numpy(Gr_j).astype(np.float32)
+                if Gr_stack is None:
+                    r_axis = to_numpy(self._pdf._r).astype(np.float32)
+                    Gr_stack = np.full((n_bins, int(r_axis.size)), np.nan, dtype=np.float32)
+                m = min(int(Gr_j.size), Gr_stack.shape[1])
+                Gr_stack[bin_i, :m] = Gr_j[:m]
+
+                if try_gr:
+                    try:
+                        density = (
+                            float(self.density_value)
+                            if density_mode == "manual"
+                            else None
+                        )
+                        self._pdf.calculate_gr(density=density, r_cut=self.r_cut)
+                        if self._pdf._pdf is not None:
+                            gr_j = to_numpy(self._pdf._pdf).astype(np.float32)
+                            if gr_stack is None:
+                                gr_stack = np.full(
+                                    (n_bins, Gr_stack.shape[1]), np.nan, dtype=np.float32
+                                )
+                            m = min(int(gr_j.size), gr_stack.shape[1])
+                            gr_stack[bin_i, :m] = gr_j[:m]
+                    except Exception:
+                        # If g(r) fails for this bin (e.g. density estimation),
+                        # leave NaN and keep going — G(r) is still valid.
+                        pass
+
+        # Bin-center position along the line in scan pixels.
+        bin_centers_t = (np.arange(n_bins, dtype=np.float64) + 0.5) / float(n_bins)
+        bin_positions_px = (bin_centers_t * length).astype(np.float32)
+
+        return {
+            "n_bins": int(n_bins),
+            "valid_bins": list(valid_bins),
+            "bin_positions_px": bin_positions_px,
+            "line_length_px": float(length),
+            "k": k_axis,
+            "Ik": Ik_stack,
+            "bg": bg_stack,
+            "k_fk": k_fk_axis if k_fk_axis is not None else np.zeros(0, dtype=np.float32),
+            "Fk": Fk_stack if Fk_stack is not None else np.zeros((n_bins, 0), dtype=np.float32),
+            "r": r_axis if r_axis is not None else np.zeros(0, dtype=np.float32),
+            "Gr": Gr_stack if Gr_stack is not None else np.zeros((n_bins, 0), dtype=np.float32),
+            "gr": gr_stack,  # None if no density set / never produced
+        }
+
     def _recompute_full(self):
         # Line-scan: compute a per-position PDF stack instead of one curve set.
         if self.analysis_mode == "line" and self.line_mode == "linescan":
@@ -1135,6 +1253,274 @@ class ShowPDF(anywidget.AnyWidget):
         plt.close(fig)
         return path
 
+    def save_results(
+        self,
+        path: str | pathlib.Path,
+        *,
+        overwrite: bool = False,
+    ) -> pathlib.Path:
+        """Save the current PDF results to a self-contained zip file.
+
+        The zip is laid out to be openable with very little Python knowledge:
+        a plaintext README, a JSON metadata file, and CSV curve files. The mask
+        (for mask mode) is the one exception — saved as ``mask.npy`` because a
+        scan-shaped boolean CSV is unwieldy.
+
+        Layout (always present):
+            README.txt
+            metadata.txt
+            curves_k.csv         k, I(k), B(k), F(k) (selected region)
+            curves_r.csv         r, G(r), g(r) (if computed)
+
+        Extra files by mode:
+            mask mode:       mask.npy
+            line/linescan:   linescan_position.csv, linescan_Ik.csv,
+                             linescan_Ik_bg.csv, linescan_Fk.csv,
+                             linescan_Gr.csv, linescan_gr.csv (if g(r) computed)
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Output zip path. Should end in ``.zip``; the extension is added if
+            missing.
+        overwrite : bool, default False
+            If False and the file already exists, raises FileExistsError.
+
+        Returns
+        -------
+        pathlib.Path
+            The written zip path.
+        """
+        import csv
+        import datetime
+        import io
+        import zipfile
+
+        path = pathlib.Path(path)
+        if path.suffix.lower() != ".zip":
+            path = path.with_suffix(path.suffix + ".zip" if path.suffix else ".zip")
+        if path.exists() and not overwrite:
+            raise FileExistsError(
+                f"{path} already exists; pass overwrite=True to replace it."
+            )
+
+        is_linescan = (
+            self.analysis_mode == "line" and self.line_mode == "linescan"
+        )
+
+        # ---- Gather data ----------------------------------------------------
+        # For single-curve modes (mask / probe / line-averaged) the curves are
+        # already in self._pdf after the most recent _recompute_full(). For
+        # linescan we run the all-modes helper so every per-bin curve is saved.
+        if is_linescan:
+            ls = self._compute_linescan_all_modes()
+            if ls is None:
+                raise RuntimeError(
+                    "Line scan has no valid bins yet — draw a line and let the "
+                    "widget compute before saving."
+                )
+            # For the single-curve "curves_*.csv" files we still emit the
+            # whole-band-averaged curves so the zip always has a 1D summary.
+            band_mask = self._line_band_mask()
+            if band_mask is None:
+                raise RuntimeError("Line is no longer active; cannot save.")
+            saved_state = (self._pdf.Ik, self._pdf.bg, getattr(self._pdf, "f", None))
+            try:
+                self._pdf.Ik = None
+                self._pdf.bg = None
+                self._pdf.calculate_Gr(
+                    mask_realspace=band_mask, **self._curve_params()
+                )
+                if self.density_mode in ("manual", "estimated"):
+                    try:
+                        density = (
+                            float(self.density_value)
+                            if self.density_mode == "manual"
+                            else None
+                        )
+                        self._pdf.calculate_gr(density=density, r_cut=self.r_cut)
+                    except Exception:
+                        pass
+                k1d, ik1d, bg1d, fk1d, r1d, gr1d, grden1d = self._extract_1d_curves()
+            finally:
+                # Restore whatever the widget was last showing — leaving self._pdf
+                # in a half-mutated state would break the next slider event.
+                self._pdf.Ik, self._pdf.bg = saved_state[0], saved_state[1]
+                if saved_state[2] is not None:
+                    self._pdf.f = saved_state[2]
+        else:
+            if self._pdf.Ik is None:
+                raise RuntimeError(
+                    "Curves not yet computed — interact with the widget once "
+                    "(or call set_mask / set_line / change a slider) before saving."
+                )
+            k1d, ik1d, bg1d, fk1d, r1d, gr1d, grden1d = self._extract_1d_curves()
+
+        # ---- Build metadata --------------------------------------------------
+        metadata = {
+            "widget_version": str(self.widget_version),
+            "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "title": self.title,
+            "scan_shape": [int(self.scan_rows), int(self.scan_cols)],
+            "analysis_mode": self.analysis_mode,
+            "line_mode": self.line_mode if self.analysis_mode == "line" else None,
+            "plot_mode_at_save": self.plot_mode,
+            "region": self._region_metadata(),
+            "fit_parameters": {
+                "k_min_fit": float(self.k_min_fit),
+                "k_max_fit": float(self.k_max_fit),
+                "k_min_window": float(self.k_min_window),
+                "k_max_window": float(self.k_max_window),
+                "k_lowpass": float(self.k_lowpass),
+                "k_highpass": float(self.k_highpass),
+                "r_min": float(self.r_min),
+                "r_max": float(self.r_max),
+                "r_step": float(self.r_step),
+                "damp_origin_oscillations": bool(self.damp_origin_oscillations),
+                "r_cut": float(self.r_cut),
+                "density_mode": self.density_mode,
+                "density_value": float(self.density_value),
+            },
+        }
+        if is_linescan:
+            metadata["region"]["n_linescan_bins"] = int(ls["n_bins"])
+            metadata["region"]["line_length_px"] = float(ls["line_length_px"])
+
+        # ---- Write into the zip ---------------------------------------------
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("metadata.txt", _format_metadata_txt(metadata))
+            zf.writestr(
+                "curves_k.csv",
+                _columns_to_csv(
+                    ["k", "Ik", "bg", "Fk"],
+                    [k1d, ik1d, bg1d, fk1d],
+                ),
+            )
+            zf.writestr(
+                "curves_r.csv",
+                _columns_to_csv(
+                    ["r", "Gr", "gr"],
+                    [r1d, gr1d, grden1d],
+                ),
+            )
+
+            if self.analysis_mode == "mask":
+                mask = self._get_mask()
+                if mask is None:
+                    mask = np.ones((self.scan_rows, self.scan_cols), dtype=bool)
+                buf = io.BytesIO()
+                np.save(buf, mask.astype(bool), allow_pickle=False)
+                zf.writestr("mask.npy", buf.getvalue())
+
+            if is_linescan:
+                pos_buf = io.StringIO()
+                w = csv.writer(pos_buf)
+                w.writerow(["bin_index", "position_px"])
+                for i, p in enumerate(ls["bin_positions_px"]):
+                    w.writerow([i, f"{float(p):.6g}"])
+                zf.writestr("linescan_position.csv", pos_buf.getvalue())
+
+                zf.writestr(
+                    "linescan_Ik.csv",
+                    _stack_to_csv_with_axis(ls["k"], ls["Ik"]),
+                )
+                zf.writestr(
+                    "linescan_Ik_bg.csv",
+                    _stack_to_csv_with_axis(ls["k"], ls["bg"]),
+                )
+                if ls["Fk"].size:
+                    zf.writestr(
+                        "linescan_Fk.csv",
+                        _stack_to_csv_with_axis(ls["k_fk"], ls["Fk"]),
+                    )
+                if ls["Gr"].size:
+                    zf.writestr(
+                        "linescan_Gr.csv",
+                        _stack_to_csv_with_axis(ls["r"], ls["Gr"]),
+                    )
+                if ls["gr"] is not None and ls["gr"].size:
+                    zf.writestr(
+                        "linescan_gr.csv",
+                        _stack_to_csv_with_axis(ls["r"], ls["gr"]),
+                    )
+
+            zf.writestr("README.txt", _build_readme(is_linescan, self.analysis_mode))
+
+        return path.resolve()
+
+    def _extract_1d_curves(self):
+        """Return (k, I(k), B(k), F(k), r, G(r), g(r)) for the current state.
+
+        Each array is float32. F(k) may be shorter than I(k); the caller is
+        responsible for padding when writing aligned CSVs. r-axis curves are
+        empty arrays when G(r) has not been computed.
+        """
+        k = np.asarray(self._pdf.qq, dtype=np.float32)
+        ik = (
+            to_numpy(self._pdf.Ik).astype(np.float32)
+            if self._pdf.Ik is not None
+            else np.zeros(0, dtype=np.float32)
+        )
+        bg = (
+            to_numpy(self._pdf.bg).astype(np.float32)
+            if self._pdf.bg is not None
+            else np.zeros(0, dtype=np.float32)
+        )
+        fk = (
+            to_numpy(self._pdf.Fk_masked).astype(np.float32)
+            if self._pdf.Fk_masked is not None
+            else np.zeros(0, dtype=np.float32)
+        )
+        if self._pdf._r is not None and self._pdf._reduced_pdf is not None:
+            r_axis = to_numpy(self._pdf._r).astype(np.float32)
+            Gr_arr = (
+                self._pdf.reduced_pdf_damped
+                if self._pdf.reduced_pdf_damped is not None
+                else self._pdf._reduced_pdf
+            )
+            gr_curve = to_numpy(Gr_arr).astype(np.float32)
+        else:
+            r_axis = np.zeros(0, dtype=np.float32)
+            gr_curve = np.zeros(0, dtype=np.float32)
+        if self._pdf._pdf is not None and r_axis.size:
+            grden = to_numpy(self._pdf._pdf).astype(np.float32)
+        else:
+            grden = np.zeros(0, dtype=np.float32)
+        return k, ik, bg, fk, r_axis, gr_curve, grden
+
+    def _region_metadata(self):
+        """Mode-specific region selection for metadata.txt."""
+        if self.analysis_mode == "mask":
+            return {
+                "kind": "mask",
+                "mask_pixel_count": int(self.mask_pixel_count),
+                "mask_fraction": float(self.mask_fraction),
+                "mask_file": "mask.npy",
+            }
+        if self.analysis_mode == "probe":
+            return {
+                "kind": "probe",
+                "probe_row": int(self.probe_row),
+                "probe_col": int(self.probe_col),
+                "probe_size": int(self.probe_size),
+                "mask_pixel_count": int(self.mask_pixel_count),
+                "mask_fraction": float(self.mask_fraction),
+            }
+        if self.analysis_mode == "line":
+            return {
+                "kind": "line",
+                "line_row0": float(self.line_row0),
+                "line_col0": float(self.line_col0),
+                "line_row1": float(self.line_row1),
+                "line_col1": float(self.line_col1),
+                "line_width": int(self.line_width),
+                "line_perpendicular": bool(self.line_perpendicular),
+                "mask_pixel_count": int(self.mask_pixel_count),
+                "mask_fraction": float(self.mask_fraction),
+            }
+        return {"kind": self.analysis_mode}
+
     # =========================================================================
     # State persistence
     # =========================================================================
@@ -1258,3 +1644,244 @@ class ShowPDF(anywidget.AnyWidget):
             f"ShowPDF(scan=({self.scan_rows}, {self.scan_cols}), "
             f"k=[{self.k_min_fit:.1f}, {self.k_max_fit:.1f}]{mask_info})"
         )
+
+
+# =============================================================================
+# save_results helpers (module-level so they stay testable / out of the trait
+# class). All CSV output uses comma separators, dot-decimals, and empty cells
+# for missing values so the files open cleanly in Excel / pandas.
+# =============================================================================
+def _format_cell(v) -> str:
+    """Float → short decimal; NaN / empty → empty cell."""
+    import math
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if math.isnan(f):
+        return ""
+    return f"{f:.7g}"
+
+
+def _columns_to_csv(headers, columns) -> str:
+    """Write ragged 1D columns as a CSV, padding shorter columns with empty cells.
+
+    Used for ``curves_k.csv`` (F(k) typically shorter than I(k)) and
+    ``curves_r.csv`` (g(r) absent if no density).
+    """
+    import csv
+    import io
+
+    n_rows = max((len(c) for c in columns), default=0)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(headers)
+    for i in range(n_rows):
+        row = []
+        for col in columns:
+            row.append(_format_cell(col[i]) if i < len(col) else "")
+        w.writerow(row)
+    return buf.getvalue()
+
+
+def _stack_to_csv_with_axis(axis, stack) -> str:
+    """2D stack as CSV with the axis values as a header row.
+
+    Layout:
+        axis_0, axis_1, ..., axis_{n_cols-1}
+        stack[0, 0], stack[0, 1], ...
+        stack[1, 0], ...
+        ...
+
+    NaN cells are written empty (linescan stacks NaN-fill invalid bins).
+    """
+    import csv
+    import io
+
+    n_cols = int(stack.shape[1])
+    axis_arr = np.asarray(axis).reshape(-1)[:n_cols]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([_format_cell(v) for v in axis_arr])
+    for row in stack:
+        w.writerow([_format_cell(v) for v in row])
+    return buf.getvalue()
+
+
+def _format_metadata_txt(meta: dict) -> str:
+    """Render the metadata dict as a human-readable plaintext file.
+
+    Layout: title + underlined section headers, two-column ``key: value``
+    pairs inside each section, no quotes / braces / brackets. Sentinel 0.0
+    values for k-range parameters render as ``disabled``.
+    """
+    def _section(title: str, char: str = "-") -> list[str]:
+        return [title, char * len(title)]
+
+    def _k_val(v) -> str:
+        return "disabled" if float(v) == 0.0 else f"{float(v):g}"
+
+    def _bool_val(v) -> str:
+        return "on" if v else "off"
+
+    lines: list[str] = []
+    lines += [
+        "quantem ShowPDF — exported results",
+        "===================================",
+        "",
+        f"Saved:           {meta['saved_at']}",
+        f"Widget version:  {meta['widget_version']}",
+        f"Title:           {meta['title']}",
+        "",
+    ]
+
+    lines += _section("Scan")
+    sr, sc = meta["scan_shape"]
+    lines.append(f"  shape:           {sr} x {sc} pixels")
+    lines.append("")
+
+    lines += _section("Analysis")
+    lines.append(f"  mode:              {meta['analysis_mode']}")
+    if meta.get("line_mode"):
+        lines.append(f"  line mode:         {meta['line_mode']}")
+    lines.append(f"  plot mode at save: {meta['plot_mode_at_save']}")
+    lines.append("")
+
+    region = meta["region"]
+    kind = region.get("kind", "unknown")
+    lines += _section(f"Region ({kind})")
+    if kind == "mask":
+        lines.append(
+            f"  pixels selected: {region.get('mask_pixel_count', 0)} "
+            f"({region.get('mask_fraction', 0.0) * 100:.1f}% of scan)"
+        )
+        lines.append(f"  mask file:       {region.get('mask_file', 'mask.npy')}")
+    elif kind == "probe":
+        lines.append(
+            f"  centre (row, col): ({region['probe_row']}, {region['probe_col']})"
+        )
+        side = 2 * int(region["probe_size"]) - 1
+        lines.append(f"  size:              {side} x {side} px")
+        lines.append(
+            f"  pixels selected:   {region.get('mask_pixel_count', 0)} "
+            f"({region.get('mask_fraction', 0.0) * 100:.1f}% of scan)"
+        )
+    elif kind == "line":
+        lines.append(
+            f"  start (row, col):  "
+            f"({region['line_row0']:.2f}, {region['line_col0']:.2f})"
+        )
+        lines.append(
+            f"  end (row, col):    "
+            f"({region['line_row1']:.2f}, {region['line_col1']:.2f})"
+        )
+        lines.append(f"  width:             {region['line_width']} px")
+        lines.append(
+            f"  perpendicular:     "
+            f"{'yes' if region['line_perpendicular'] else 'no'}"
+        )
+        lines.append(
+            f"  pixels selected:   {region.get('mask_pixel_count', 0)} "
+            f"({region.get('mask_fraction', 0.0) * 100:.1f}% of scan)"
+        )
+        if "n_linescan_bins" in region:
+            lines.append(f"  linescan bins:     {region['n_linescan_bins']}")
+            lines.append(f"  line length:       {region['line_length_px']:.2f} px")
+    lines.append("")
+
+    lines += _section("Fit parameters")
+    fp = meta["fit_parameters"]
+    lines.append(f"  k_min_fit:               {_k_val(fp['k_min_fit'])}")
+    lines.append(f"  k_max_fit:               {_k_val(fp['k_max_fit'])}")
+    lines.append(f"  k_min_window:            {_k_val(fp['k_min_window'])}")
+    lines.append(f"  k_max_window:            {_k_val(fp['k_max_window'])}")
+    lines.append(f"  k_lowpass:               {_k_val(fp['k_lowpass'])}")
+    lines.append(f"  k_highpass:              {_k_val(fp['k_highpass'])}")
+    lines.append(f"  r_min:                   {float(fp['r_min']):g}")
+    lines.append(f"  r_max:                   {float(fp['r_max']):g}")
+    lines.append(f"  r_step:                  {float(fp['r_step']):g}")
+    lines.append(
+        f"  damp_origin_oscillations: {_bool_val(fp['damp_origin_oscillations'])}"
+    )
+    lines.append(f"  r_cut:                   {float(fp['r_cut']):g}")
+    lines.append(f"  density_mode:            {fp['density_mode']}")
+    lines.append(f"  density_value:           {float(fp['density_value']):g}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _build_readme(is_linescan: bool, analysis_mode: str) -> str:
+    lines = [
+        "quantem ShowPDF — exported results",
+        "===================================",
+        "",
+        "Files in this archive:",
+        "",
+        "  metadata.txt    Mode, region selection, fit parameters, axis info,",
+        "                  timestamp. Plain text — open in any editor.",
+        "",
+        "  curves_k.csv    Reciprocal-space curves for the selected region:",
+        "                  columns are  k, I(k), B(k), F(k).",
+        "                  Background B(k) is the fit; F(k) is the windowed",
+        "                  reduced structure factor (may end before I(k) does).",
+        "",
+        "  curves_r.csv    Real-space curves: columns are  r, G(r), g(r).",
+        "                  g(r) is only present when a density was set.",
+        "",
+    ]
+    if analysis_mode == "mask":
+        lines += [
+            "  mask.npy        Boolean 2D array (scan_rows × scan_cols) marking",
+            "                  the scan positions used. Load with numpy:",
+            "                      import numpy as np",
+            "                      mask = np.load('mask.npy')",
+            "",
+        ]
+    if is_linescan:
+        lines += [
+            "  linescan_position.csv",
+            "                  Two columns: bin_index, position_px.",
+            "                  position_px is the bin center along the drawn",
+            "                  line, in scan pixels.",
+            "",
+            "  linescan_Ik.csv, linescan_Ik_bg.csv, linescan_Fk.csv,",
+            "  linescan_Gr.csv, linescan_gr.csv",
+            "                  2D stacks of per-bin curves. The FIRST row of",
+            "                  each file is the axis (k for Ik/Ik_bg/Fk; r for",
+            "                  Gr/gr). Each subsequent row is one bin (same",
+            "                  order as linescan_position.csv). Empty cells",
+            "                  indicate bins with no scan positions inside.",
+            "",
+        ]
+    lines += [
+        "Quick load in Python:",
+        "",
+        "    import numpy as np",
+        "",
+        "    # 1D curves (Excel-style: skip the header row, blank cells → NaN)",
+        "    curves_k = np.genfromtxt('curves_k.csv', delimiter=',',",
+        "                             names=True, missing_values='', filling_values=np.nan)",
+        "    k    = curves_k['k']",
+        "    Ik   = curves_k['Ik']",
+        "    bg   = curves_k['bg']",
+        "    Fk   = curves_k['Fk']",
+        "",
+        "    # metadata.txt is plain text — read it with open() or just look at it",
+        "    # in a text editor; the values are also visible in any browser.",
+        "",
+    ]
+    if is_linescan:
+        lines += [
+            "    # 2D linescan stack — first row is the axis, rest is data",
+            "    raw = np.genfromtxt('linescan_Gr.csv', delimiter=',',",
+            "                        missing_values='', filling_values=np.nan)",
+            "    r_axis = raw[0]",
+            "    Gr_stack = raw[1:]   # shape (n_bins, n_r)",
+            "",
+        ]
+    lines += [
+        "Excel / Google Sheets: open any .csv file directly.",
+        "",
+    ]
+    return "\n".join(lines)

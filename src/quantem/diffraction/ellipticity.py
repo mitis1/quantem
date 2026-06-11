@@ -168,8 +168,8 @@ def fit_elliptical_distortion(
         bin_idx = ((r_flat - r_inner) / bin_step).long().clamp(0, nbins - 1)
         radial_integral = torch.zeros(nbins, device=device).scatter_add_(0, bin_idx, val_fit)
         # get ring peak's radius in pixels (bin center)
-        peak_idx = int(radial_integral.argmax().item())
-        R_init = float(r_inner + (peak_idx + 0.5) * bin_step)
+        peak_idx = radial_integral.argmax().item()
+        R_init = r_inner + (peak_idx + 0.5) * bin_step
         # set init param guesses
         c_bkgd_init = max(float(val_fit.min()), 0.0)
         near_ring = val_fit[(r_flat - R_init).abs() < 3.0]
@@ -270,7 +270,7 @@ def fit_elliptical_distortion(
     # Extract final parameters
     with torch.no_grad():
         final_params = _to_physical(best_raw)
-    final_loss = best_loss * float(val_fit.numel())
+    final_loss = best_loss * val_fit.numel()
     a_fit, b_fit, theta_fit_rad = convert_ellipse_params(
         float(final_params[8]),
         float(final_params[9]),

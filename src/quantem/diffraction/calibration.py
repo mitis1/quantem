@@ -6,8 +6,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from scipy import sparse
-from scipy.sparse.linalg import spsolve
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
@@ -17,8 +15,8 @@ from quantem.diffraction.polar_transform import find_origin_angular_grid, polar_
 
 
 def _arpls_baseline(
-    y: NDArray, lam: float = 0.1, ratio: float = 1e-2, niter: int = 100
-) -> NDArray:
+    y: torch.Tensor, lam: float = 0.1, ratio: float = 1e-2, niter: int = 100
+) -> torch.Tensor:
     """Asymmetrically reweighted penalized least squares baseline.
 
     Smoothness-regularised lower-envelope estimator that handles both
@@ -31,7 +29,7 @@ def _arpls_baseline(
 
     Parameters
     ----------
-    y : NDArray
+    y : torch.Tensor
         1D signal to fit a baseline under.
     lam : float
         Smoothness penalty. Larger -> stiffer baseline.
@@ -42,26 +40,39 @@ def _arpls_baseline(
 
     Returns
     -------
-    z : NDArray
-        Smooth baseline, same length as ``y``.
+    z : torch.Tensor
+        Smooth baseline, same length, device, and dtype-promoted-to-float64
+        as ``y``.
     """
-    y = np.asarray(y, dtype=float)
-    L = len(y)
-    D = sparse.diags([1.0, -2.0, 1.0], [0, -1, -2], shape=(L, L - 2))
+    y = y.to(dtype=torch.float64)
+    L = y.numel()
+    device = y.device
+    # 2nd-difference operator D is L x (L-2); column j has [1, -2, 1] at
+    # rows j, j+1, j+2. H = lam * D @ D.T is the smoothness penalty (band-5).
+    col = torch.arange(L - 2, device=device)
+    D = torch.zeros(L, L - 2, device=device, dtype=torch.float64)
+    D[col, col] = 1.0
+    D[col + 1, col] = -2.0
+    D[col + 2, col] = 1.0
     H = lam * (D @ D.T)
-    w = np.ones(L)
+    diag_rows = torch.arange(L, device=device)
+
+    w = torch.ones(L, device=device, dtype=torch.float64)
+    z = y.clone()
     for _ in range(niter):
-        W = sparse.diags(w)
-        z = spsolve((W + H).tocsc(), w * y)
+        A = H.clone()
+        A[diag_rows, diag_rows] += w  # A = diag(w) + H, symmetric PD
+        z = torch.linalg.solve(A, w * y)
         d = y - z
         dn = d[d < 0]
-        if dn.size == 0:
+        if dn.numel() == 0:
             break
-        m, s = dn.mean(), dn.std()
+        m = dn.mean()
+        s = dn.std(correction=0)  # ddof=0 to match numpy default
         # Asymmetric reweighting; clip the logistic exponent so peaks don't overflow
-        expo = np.clip(2.0 * (d - (2.0 * s - m)) / (s + 1e-12), -50.0, 50.0)
-        wt = 1.0 / (1.0 + np.exp(expo))
-        if np.linalg.norm(w - wt) / (np.linalg.norm(w) + 1e-12) < ratio:
+        expo = torch.clamp(2.0 * (d - (2.0 * s - m)) / (s + 1e-12), -50.0, 50.0)
+        wt = 1.0 / (1.0 + torch.exp(expo))
+        if torch.linalg.norm(w - wt) / (torch.linalg.norm(w) + 1e-12) < ratio:
             break
         w = wt
     return z
@@ -103,7 +114,7 @@ def _find_peaks_torch(
     -------
     peaks : 1D torch.Tensor (long), peak indices sorted ascending.
     """
-    n = int(y.numel())
+    n = y.numel()
     if n < 3:
         return torch.empty(0, dtype=torch.long, device=y.device)
 
@@ -324,7 +335,7 @@ class ReciprocalCalibration:
                 )
                 mean_dp = arr4d_t[mask_t].mean(dim=0, dtype=torch.float64).cpu().numpy()
             else:
-                n_pos = int(data.shape[0] * data.shape[1])
+                n_pos = data.shape[0] * data.shape[1]
                 print(f"Averaging all {n_pos} diffraction patterns ...")
                 mean_dp = arr4d_t.mean(dim=(0, 1), dtype=torch.float64).cpu().numpy()
             mean_ds = Dataset4dstem.from_array(
@@ -423,7 +434,9 @@ class ReciprocalCalibration:
         bg = profile.copy()
         # arPLS in log space so the steep central-beam decay is tractable
         log_seg = np.log(np.clip(profile[radial_min:], 0.0, None) + 1.0)
-        bg[radial_min:] = np.exp(_arpls_baseline(log_seg, lam=lam)) - 1.0
+        log_seg_t = torch.from_numpy(np.ascontiguousarray(log_seg))
+        bg_seg = (torch.exp(_arpls_baseline(log_seg_t, lam=lam)) - 1.0).cpu().numpy()
+        bg[radial_min:] = bg_seg
         bg = np.clip(bg, 0.0, None)
         self.background = bg
         return self.background
@@ -438,9 +451,15 @@ class ReciprocalCalibration:
     ) -> NDArray:
         """Detect peaks in the background-subtracted radial profile.
 
-        Runs :func:`scipy.signal.find_peaks` on
-        ``radial_profile - background``. If :attr:`background` has not been
-        fit yet, calls :meth:`fit_bg` with defaults first.
+        Runs :func:`_find_peaks_torch` on ``radial_profile - background``,
+        then refines each detected peak to sub-pixel precision via a
+        parabolic vertex fit to its three nearest samples. The integer
+        bins remain in :attr:`peak_indices` (for residual-value lookups);
+        the refined positions go in :attr:`peak_pixel_positions` and feed
+        :meth:`calibrate`'s least-squares fit.
+
+        If :attr:`background` has not been fit yet, calls :meth:`fit_bg`
+        with defaults first.
 
         Parameters
         ----------
@@ -451,12 +470,14 @@ class ReciprocalCalibration:
             (the innermost rings). Useful when the detector finds more
             candidates than you want to use for the calibration fit.
         distance, prominence, height
-            Passed through to ``scipy.signal.find_peaks``.
+            Passed through to :func:`_find_peaks_torch` (scipy-equivalent
+            semantics).
 
         Returns
         -------
-        peak_indices : NDArray
-            Indices into :attr:`radial_profile` where peaks were found.
+        peak_positions : NDArray
+            Sub-pixel-refined peak positions (same units as
+            :attr:`radial_pixel_positions`).
         """
         if self.background is None:
             self.fit_bg(radial_min=radial_min)
@@ -478,9 +499,31 @@ class ReciprocalCalibration:
         if n_peaks is not None:
             indices = indices[:n_peaks]
 
+        # Sub-pixel parabolic refinement: vertex offset of the parabola
+        # through residual[idx-1], residual[idx], residual[idx+1]. Clipped
+        # to [-1, 1] bin steps to guard against flat / inverted curvature.
+        positions = self.radial_pixel_positions
+        step = float(positions[1] - positions[0]) if len(positions) > 1 else 1.0
+        refined = np.empty_like(indices, dtype=float)
+        for k, idx in enumerate(indices):
+            base = float(positions[idx])
+            if 0 < idx < len(residual) - 1:
+                y0 = float(residual[idx - 1])
+                y1 = float(residual[idx])
+                y2 = float(residual[idx + 1])
+                denom = y0 - 2.0 * y1 + y2
+                if denom != 0.0:
+                    delta = 0.5 * (y0 - y2) / denom
+                    delta = max(-1.0, min(1.0, delta))
+                else:
+                    delta = 0.0
+                refined[k] = base + delta * step
+            else:
+                refined[k] = base
+
         self.peak_indices = indices
-        self.peak_pixel_positions = self.radial_pixel_positions[indices]
-        return indices
+        self.peak_pixel_positions = refined
+        return refined
 
     # ------------------------------------------------------------------
     # Calibration
@@ -584,7 +627,13 @@ class ReciprocalCalibration:
     # Plotting helpers
     # ------------------------------------------------------------------
     def plot_radial_profile(self) -> plt.Figure:
-        """Plot the radial profile, background fit, and residual with peaks."""
+        """Plot the radial profile, background fit, and residual with peaks.
+
+        Peak markers sit at the sub-pixel-refined positions stored in
+        :attr:`peak_pixel_positions` (their y-values are linearly
+        interpolated onto the underlying curve). If :meth:`calibrate` has
+        been run, each marker is annotated with the matched ``{hkl}``.
+        """
         has_bg = self.background is not None
         n_axes = 2 if has_bg else 1
 
@@ -592,20 +641,28 @@ class ReciprocalCalibration:
         if n_axes == 1:
             axes = [axes]
 
+        marker_kw = dict(s=40, color="red", alpha=0.5, edgecolors="none",
+                         zorder=5, label="Peaks")
+        ann_kw = dict(textcoords="offset points", xytext=(5, 6),
+                      fontsize=7, color="red", alpha=0.9)
+
+        def _annotate_peaks(ax, y_curve):
+            if self.peak_pixel_positions is None:
+                return
+            peak_y = np.interp(self.peak_pixel_positions,
+                               self.radial_pixel_positions, y_curve)
+            ax.scatter(self.peak_pixel_positions, peak_y, **marker_kw)
+            if self.matched_hkl is not None:
+                for r_sub, hkl, y in zip(self.peak_pixel_positions,
+                                          self.matched_hkl, peak_y):
+                    ax.annotate(f"{{{hkl}}}", (r_sub, y), **ann_kw)
+
         # --- Left panel: raw profile + background ---
         ax = axes[0]
         ax.plot(self.radial_pixel_positions, self.radial_profile, label="I(r)")
         if has_bg:
             ax.plot(self.radial_pixel_positions, self.background, "--", label="Background")
-        if self.peak_pixel_positions is not None:
-            ax.plot(
-                self.peak_pixel_positions,
-                self.radial_profile[self.peak_indices],
-                "x",
-                color="red",
-                markersize=8,
-                label="Peaks",
-            )
+        _annotate_peaks(ax, self.radial_profile)
         ax.set_yscale("log")
         ax.set_xlabel("Radial position (pixels)")
         ax.set_ylabel("Mean intensity")
@@ -617,15 +674,7 @@ class ReciprocalCalibration:
             ax2 = axes[1]
             residual = getattr(self, "_residual", self.radial_profile - self.background)
             ax2.plot(self.radial_pixel_positions, residual, label="I(r) - B(r)")
-            if self.peak_pixel_positions is not None:
-                ax2.plot(
-                    self.peak_pixel_positions,
-                    residual[self.peak_indices],
-                    "x",
-                    color="red",
-                    markersize=8,
-                    label="Peaks",
-                )
+            _annotate_peaks(ax2, residual)
             ax2.axhline(0, color="gray", linewidth=0.5)
             ax2.set_xlabel("Radial position (pixels)")
             ax2.set_ylabel("Residual intensity")
@@ -670,11 +719,15 @@ class ReciprocalCalibration:
         for ax, ps in zip(axes, trial_sizes):
             ax.plot(self.radial_pixel_positions, residual, "b-", linewidth=1)
             if self.peak_pixel_positions is not None:
-                ax.plot(
+                peak_y = np.interp(self.peak_pixel_positions,
+                                   self.radial_pixel_positions, residual)
+                ax.scatter(
                     self.peak_pixel_positions,
-                    residual[self.peak_indices.astype(int)],
-                    "rx",
-                    markersize=8,
+                    peak_y,
+                    s=40,
+                    color="red",
+                    alpha=0.5,
+                    edgecolors="none",
                     zorder=5,
                 )
             y_top = max(residual.max() * 1.05, 1.0)

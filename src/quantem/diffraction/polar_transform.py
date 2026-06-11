@@ -27,6 +27,7 @@ def find_origin_angular_grid(
     device: str = "cpu",
     batch_size: int = 16,
     local_margin: int = 40,
+    kpow: float = 0.0,
 ) -> NDArray:
     """
     Automatic diffraction center finding by minimizing angular intensity
@@ -66,6 +67,9 @@ def find_origin_angular_grid(
         ``(2*local_margin+1)`` square window centered on the global
         origin. Set this large enough to cover the worst-case descan
         drift across the scan.
+    kpow : float
+        Up-weight each ring's contribution to the score by ``k**kpow``
+        (k = ring radius). 
 
     Returns
     -------
@@ -138,6 +142,12 @@ def find_origin_angular_grid(
     n_r = radial_bins.numel()
     min_r_idx = 0
     max_r_idx = int(np.ceil(0.9 * n_r))
+    # k-weighting (k = ring radius). None when kpow == 0 to skip the multiply.
+    ring_weights = (
+        None
+        if kpow == 0.0
+        else (radial_bins[min_r_idx:max_r_idx].to(device) ** kpow).to(torch.float32)
+    )
     # Normalize offsets to [-1, 1] because grid_sample expects normalized coordinates
     col_norm_scale = 2.0 / (n_col - 1)
     row_norm_scale = 2.0 / (n_row - 1)
@@ -161,7 +171,7 @@ def find_origin_angular_grid(
         device,
         step=2,
     )
-    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx)
+    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx, ring_weights)
     valid = (
         (rows >= safe_low) & (rows <= safe_high_row) & (cols >= safe_low) & (cols <= safe_high_col)
     )
@@ -181,7 +191,7 @@ def find_origin_angular_grid(
         device,
         step=1,
     )
-    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx)
+    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx, ring_weights)
     valid = (
         (rows >= safe_low) & (rows <= safe_high_row) & (cols >= safe_low) & (cols <= safe_high_col)
     )
@@ -246,7 +256,12 @@ def find_origin_angular_grid(
         region = polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[
             ..., min_r_idx:max_r_idx
         ]
-        scores = region.std(dim=2).sum(dim=2) / (region.mean(dim=2).sum(dim=2) + 1e-6)
+        std_r = region.std(dim=2)
+        mean_r = region.mean(dim=2)
+        if ring_weights is not None:
+            std_r = std_r * ring_weights
+            mean_r = mean_r * ring_weights
+        scores = std_r.sum(dim=2) / (mean_r.sum(dim=2) + 1e-6)
         valid = (
             (cand_rows >= safe_low)
             & (cand_rows <= safe_high_row)
@@ -275,9 +290,12 @@ def find_origin_angular_grid(
             align_corners=True,
         )
         region_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx]
-        scores_coarse = region_coarse.std(dim=2).sum(dim=2) / (
-            region_coarse.mean(dim=2).sum(dim=2) + 1e-6
-        )
+        std_r_coarse = region_coarse.std(dim=2)
+        mean_r_coarse = region_coarse.mean(dim=2)
+        if ring_weights is not None:
+            std_r_coarse = std_r_coarse * ring_weights
+            mean_r_coarse = mean_r_coarse * ring_weights
+        scores_coarse = std_r_coarse.sum(dim=2) / (mean_r_coarse.sum(dim=2) + 1e-6)
         scores_coarse = scores_coarse.masked_fill(~coarse_valid[:, None], float("inf"))
         best_coarse = scores_coarse.argmin(dim=0)  # best candidate per DP
         current_row, current_col = coarse_rows[best_coarse], coarse_cols[best_coarse]
@@ -661,9 +679,12 @@ def _angular_std_scores(
     grids: torch.Tensor,
     min_r_idx: int,
     max_r_idx: int,
+    ring_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score candidate origins by angular std over a mid-radius band.
-    Lower scores indicate better centering."""
+    Lower scores indicate better centering. Optional ``ring_weights``
+    (shape ``(n_r_window,)``) applies a per-ring weighting before
+    summation (e.g. ``k**kpow`` for high-k emphasis)."""
     n = grids.shape[0]
     # Sample the diffraction pattern at each candidate's polar grid positions
     polars = F.grid_sample(
@@ -679,7 +700,12 @@ def _angular_std_scores(
     # do not win on absolute std alone (relevant when search windows are
     # wide enough to include centers far from the direct beam).
     region = polars.squeeze(1)[:, :, min_r_idx:max_r_idx]
-    return region.std(dim=1).sum(dim=1) / (region.mean(dim=1).sum(dim=1) + 1e-6)
+    std_r = region.std(dim=1)
+    mean_r = region.mean(dim=1)
+    if ring_weights is not None:
+        std_r = std_r * ring_weights
+        mean_r = mean_r * ring_weights
+    return std_r.sum(dim=1) / (mean_r.sum(dim=1) + 1e-6)
 
 
 def _quadratic_subpixel_offset(patch: torch.Tensor) -> torch.Tensor:

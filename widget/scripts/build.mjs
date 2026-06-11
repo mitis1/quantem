@@ -9,6 +9,7 @@ const watch = process.argv.includes("--watch");
 const widgets = [
   { name: "show2d" },
   { name: "show4dstem" },
+  { name: "showpdf" },
 ];
 
 rmSync("src/quantem/widget/static", { recursive: true, force: true });

@@ -1253,6 +1253,7 @@ class ShowPDF(anywidget.AnyWidget):
         plt.close(fig)
         return path
 
+<<<<<<< HEAD
     def save_results(
         self,
         path: str | pathlib.Path,
@@ -1521,6 +1522,8 @@ class ShowPDF(anywidget.AnyWidget):
             }
         return {"kind": self.analysis_mode}
 
+=======
+>>>>>>> origin/showpdf-widget
     # =========================================================================
     # State persistence
     # =========================================================================
@@ -1644,6 +1647,7 @@ class ShowPDF(anywidget.AnyWidget):
             f"ShowPDF(scan=({self.scan_rows}, {self.scan_cols}), "
             f"k=[{self.k_min_fit:.1f}, {self.k_max_fit:.1f}]{mask_info})"
         )
+<<<<<<< HEAD
 
 
 # =============================================================================
@@ -1885,3 +1889,5 @@ def _build_readme(is_linescan: bool, analysis_mode: str) -> str:
         "",
     ]
     return "\n".join(lines)
+=======
+>>>>>>> origin/showpdf-widget
